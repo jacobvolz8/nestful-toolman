@@ -3,6 +3,8 @@ from tqdm import tqdm
 from utils import *
 from output_parsers import *
 from sklearn.metrics import accuracy_score
+from pathlib import Path
+
 
 def handler(signum, frame): 
     raise TimeoutError("Time limit exceeded!") 
@@ -361,9 +363,9 @@ def calculate_weighted_avg_score(res_lst):
     
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model_name", type=str)
-    parser.add_argument("--result_file_path", type=str)
-    parser.add_argument("--executable_func_dir", type=str)
+    parser.add_argument("--model_name", type=str, default="granite-3.0-8b-instruct")
+    parser.add_argument("--result_file_path", type=str,  default="results/nestful_3/gpt-4o-mini-nestful/output.jsonl")
+    parser.add_argument("--executable_func_dir", type=str,  default="data_v2/executable_functions")
     args = parser.parse_args()
 
     data = read_jsonlines(args.result_file_path)
