@@ -211,7 +211,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     default_dataset = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "data_v2", "nestful_data2.jsonl")
+        os.path.join(os.path.dirname(__file__), "..", "data_v2", "nestful_data.jsonl")
     )
 
     parser.add_argument(
