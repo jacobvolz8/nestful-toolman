@@ -211,7 +211,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     default_dataset = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "data_v2", "nestful_data.jsonl")
+        os.path.join(os.path.dirname(__file__), "..", "data_v2", "nestful_data._small.jsonl")
     )
 
     parser.add_argument(
@@ -227,8 +227,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--llm_proxy_url",
         type=str,
-        default="http://localhost:8091",
-        help="Local LLM proxy URL, e.g. http://localhost:8091",
+        default="http://localhost:8080",
+        help="Local LLM proxy URL, e.g. http://localhost:8080",
     )
     parser.add_argument(
         "--llm_proxy_model",
