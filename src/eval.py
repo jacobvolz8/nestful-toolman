@@ -2,6 +2,7 @@ import os, json, argparse
 from utils import *
 from instruct_data_prep import get_instruct_data
 import gc
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 def _proxy_generate(prompts, *, proxy_url, model_fqn, temperature, max_tokens, timeout=600):
     import urllib.request
@@ -34,7 +35,7 @@ def _proxy_generate(prompts, *, proxy_url, model_fqn, temperature, max_tokens, t
         raise RuntimeError(f"LLM proxy response had no texts. Keys: {list(parsed.keys())}")
     return [t.strip() for t in texts]
 
-def _proxy_nestful(query, tools, *, proxy_url, model_fqn, temperature, max_tokens, enable_ptc=False, tool_choice="required", system_prompt="", js_extract_timeout_ms=None, timeout=600):
+def _proxy_nestful(query, tools, *, proxy_url, model_fqn, temperature, max_tokens, batch_size, enable_ptc=False, tool_choice="required", system_prompt="", js_extract_timeout_ms=None, timeout=600):
     import urllib.request
     import urllib.error
 
@@ -45,6 +46,7 @@ def _proxy_nestful(query, tools, *, proxy_url, model_fqn, temperature, max_token
         "tools": tools,
         "temperature": float(temperature),
         "max_tokens": int(max_tokens),
+        "batch_size": int(batch_size),
         "system_prompt": system_prompt or "",
         "enable_ptc": bool(enable_ptc),
         "tool_choice": tool_choice or "required",
@@ -80,20 +82,17 @@ def eval_code(args):
     
     data = read_jsonlines(args.dataset)
 
-    # If you want to call the Go proxy's /nestful endpoint, we should send the *raw*
-    # sample input + tools (not the ICL-formatted prompt used for /generate).
     if args.llm_proxy_url and getattr(args, "llm_proxy_endpoint", "generate") == "nestful":
         print("### Using local NESTFUL proxy (/nestful)...")
         model_fqn = args.llm_proxy_model or args.model
 
-        output_list = []
         count_total = len(data)
-        for idx, sample in enumerate(data):
-            if (idx % max(1, int(args.batch_size))) == 0:
-                print(f"### At sample {idx + 1} out of {count_total}...")
+        output_list = [None] * count_total
 
+        def run_one(idx, sample):
             query = sample.get("input", "")
             tools_spec = sample.get("tools") or []
+
             gen_text = _proxy_nestful(
                 query,
                 tools_spec,
@@ -101,31 +100,43 @@ def eval_code(args):
                 model_fqn=model_fqn,
                 temperature=args.temperature,
                 max_tokens=args.max_tokens,
+                batch_size=args.batch_size,
                 enable_ptc=args.enable_ptc,
                 tool_choice=args.tool_choice,
                 system_prompt=args.system_prompt,
                 js_extract_timeout_ms=args.js_extract_timeout_ms,
             )
 
-            # Keep output format consistent with the rest of the codebase (strings in jsonl).
-            output_list.append(
-                {
-                    "sample_id": sample.get("sample_id", ""),
-                    "input": query,
-                    "output": json.dumps(sample.get("output", [])),
-                    "gold_answer": json.dumps(sample.get("gold_answer")),
-                    "tools": json.dumps(tools_spec),
-                    "generated_text": gen_text,
-                }
-            )
+            return idx, {
+                "sample_id": sample.get("sample_id", ""),
+                "input": query,
+                "output": json.dumps(sample.get("output", [])),
+                "gold_answer": json.dumps(sample.get("gold_answer")),
+                "tools": json.dumps(tools_spec),
+                "generated_text": gen_text,
+            }
+
+        max_workers = max(1, int(args.batch_size))
+        print(f"### Running up to {max_workers} NESTFUL requests in parallel...")
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(run_one, idx, sample) for idx, sample in enumerate(data)]
+
+            completed = 0
+            for future in as_completed(futures):
+                idx, result = future.result()
+                output_list[idx] = result
+                completed += 1
+                if completed % max_workers == 0 or completed == count_total:
+                    print(f"### Completed {completed} out of {count_total} samples...")
 
         print("### Saving...")
-        save_path = os.path.join(args.save_directory, f"nestful_{args.icl_count}", args.model_name, "output.jsonl")
+        save_path = os.path.join(args.save_directory, f"nestful_{args.icl_count}", args.model_name, "output_PTC.jsonl")
         print(f"### Save Path: {save_path}")
         os.makedirs(os.path.join(args.save_directory, f"nestful_{args.icl_count}", args.model_name), exist_ok=True)
         write_jsonlines(output_list, save_path)
 
-        print(f"### DONE...!!!")
+        print("### DONE...!!!")
         return
 
     for i in range(len(data)):
@@ -211,13 +222,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     default_dataset = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "data_v2", "nestful_data._small.jsonl")
+        os.path.join(os.path.dirname(__file__), "..", "data_v2", "error_task.jsonl")
     )
 
     parser.add_argument(
         "--model",
         type=str,
-        default="openai/gpt-4o-mini",
+        #default="openai/gpt-4o-mini",
+        default="openai/gpt-5-mini",
     )
     parser.add_argument(
         "--model_name",
@@ -260,8 +272,8 @@ if __name__ == "__main__":
     parser.add_argument("--dataset", type=str, default=default_dataset)
     parser.add_argument("--icl_count", default=3, type=int)
     parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--max_tokens", type=int, default=1000)
-    parser.add_argument("--batch_size", type=int, default=10)
+    parser.add_argument("--max_tokens", type=int, default=5000)
+    parser.add_argument("--batch_size", type=int, default=100)
     parser.add_argument(
         "--js_extract_timeout_ms",
         type=int,
@@ -272,15 +284,33 @@ if __name__ == "__main__":
         "--system_prompt",
         type=str,
         default=(
-            "Inside code_execution, you MUST use the provided tools for all arithmetic; "
-            "do not use + - * / except for loop counters; call add/multiply/divide/... "
-            "for each step; returning without tool calls is invalid. "
-            "Do not use +-*/ for math. Use add/subtract/multiply/divide for ALL arithmetic. "
-            "Do not nest tool calls. Always assign: const a = divide({...}); then pass a.result vidare. "
-            "Every tool call must include every required arg (arg_0, arg_1, ..., arg_n)."
+            "Inside code_execution you MUST call the provided tools for ALL math. Do NOT use + - * / for math (only for loop counters)."
+"You MUST call at least one tool; returning without tool calls is invalid."
+
+"Call tools only as global functions: tool_name({arg_0: ..., arg_1: ..., ...})."
+"Arguments: use ONLY keys that exist in the tool's input schema (typically arg_0, arg_1, ...). Never invent keys like result/output_0 as arguments."
+
+"Do NOT nest tool calls. Always do:"
+"const a = divide({arg_0: ..., arg_1: ...});"            
         ),
     )
 
     args = parser.parse_args()
     print(args)
     eval_code(args)
+
+
+
+
+#"Inside code_execution, you MUST use the provided tools for all arithmetic; "
+#            "do not use + - * / except for loop counters; call add/multiply/divide/... "
+#            "for each step; returning without tool calls is invalid. "
+#            "Do not use +-*/ for math. Use add/subtract/multiply/divide for ALL arithmetic. "
+#            "Do not nest tool calls. Always assign: const a = divide({...}); then pass a.result vidare. "
+#            "Every tool call must include every required arg (arg_0, arg_1, ..., arg_n)."
+
+#"then pass a.<output_key> into later calls."
+#
+#"Output keys: when you use the output of a previous tool call, access ONLY keys listed in that tool's Output keys (e.g. a.result or a.output_0). Never guess output keys."
+#
+#"Prefer the shortest valid tool-call sequence; avoid unnecessary tool calls."
