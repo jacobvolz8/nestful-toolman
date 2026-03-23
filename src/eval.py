@@ -87,9 +87,13 @@ def eval_code(args):
         model_fqn = args.llm_proxy_model or args.model
 
         count_total = len(data)
-        output_list = [None] * count_total
+        save_every = max(1, int(args.save_every))
+        max_workers = max(1, int(args.batch_size))
 
-        def run_one(idx, sample):
+        save_dir = os.path.join(args.save_directory, f"nestful_{args.icl_count}", args.model_name)
+        os.makedirs(save_dir, exist_ok=True)
+
+        def run_one(local_idx, sample):
             query = sample.get("input", "")
             tools_spec = sample.get("tools") or []
 
@@ -107,7 +111,7 @@ def eval_code(args):
                 js_extract_timeout_ms=args.js_extract_timeout_ms,
             )
 
-            return idx, {
+            return local_idx, {
                 "sample_id": sample.get("sample_id", ""),
                 "input": query,
                 "output": json.dumps(sample.get("output", [])),
@@ -116,25 +120,43 @@ def eval_code(args):
                 "generated_text": gen_text,
             }
 
-        max_workers = max(1, int(args.batch_size))
         print(f"### Running up to {max_workers} NESTFUL requests in parallel...")
+        print(f"### Saving results every {save_every} samples...")
 
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(run_one, idx, sample) for idx, sample in enumerate(data)]
+        part_num = 1
+        completed_total = 0
 
-            completed = 0
-            for future in as_completed(futures):
-                idx, result = future.result()
-                output_list[idx] = result
-                completed += 1
-                if completed % max_workers == 0 or completed == count_total:
-                    print(f"### Completed {completed} out of {count_total} samples...")
+        for chunk_start in range(0, count_total, save_every):
+            chunk_end = min(chunk_start + save_every, count_total)
+            chunk = data[chunk_start:chunk_end]
+            chunk_results = [None] * len(chunk)
 
-        print("### Saving...")
-        save_path = os.path.join(args.save_directory, f"nestful_{args.icl_count}", args.model_name, "output_PTC.jsonl")
-        print(f"### Save Path: {save_path}")
-        os.makedirs(os.path.join(args.save_directory, f"nestful_{args.icl_count}", args.model_name), exist_ok=True)
-        write_jsonlines(output_list, save_path)
+            print(f"### Processing samples {chunk_start} to {chunk_end - 1}...")
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = [
+                    executor.submit(run_one, local_idx, sample)
+                    for local_idx, sample in enumerate(chunk)
+                ]
+
+                completed_chunk = 0
+                for future in as_completed(futures):
+                    local_idx, result = future.result()
+                    chunk_results[local_idx] = result
+                    completed_chunk += 1
+                    completed_total += 1
+
+                    if completed_chunk % max_workers == 0 or completed_chunk == len(chunk):
+                        print(
+                            f"### Completed {completed_chunk}/{len(chunk)} in current chunk "
+                            f"({completed_total}/{count_total} total)..."
+                        )
+
+            save_path = os.path.join(save_dir, f"output_test_{part_num}.jsonl")
+            print(f"### Saving chunk {part_num} to: {save_path}")
+            write_jsonlines(chunk_results, save_path)
+
+            part_num += 1
 
         print("### DONE...!!!")
         return
@@ -222,7 +244,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     default_dataset = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "data_v2", "error_task.jsonl")
+        os.path.join(os.path.dirname(__file__), "..", "data_v2", "nestful_data._small.jsonl")
     )
 
     parser.add_argument(
@@ -273,7 +295,8 @@ if __name__ == "__main__":
     parser.add_argument("--icl_count", default=3, type=int)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max_tokens", type=int, default=5000)
-    parser.add_argument("--batch_size", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=20)
+    parser.add_argument("--save_every", type=int, default=100)
     parser.add_argument(
         "--js_extract_timeout_ms",
         type=int,
@@ -291,7 +314,19 @@ if __name__ == "__main__":
 "Arguments: use ONLY keys that exist in the tool's input schema (typically arg_0, arg_1, ...). Never invent keys like result/output_0 as arguments."
 
 "Do NOT nest tool calls. Always do:"
-"const a = divide({arg_0: ..., arg_1: ...});"            
+"const a = divide({arg_0: ..., arg_1: ...});"       
+
+
+"This code is executed only for tool-call extraction, not for actual problem solving with real tool outputs."
+"Therefore: "
+"- never use loops or recursion "
+"- never retry the same tool repeatedly "
+"- never use tool outputs to control iteration or branching "
+"- generate only a short, finite, straight-line sequence of tool calls "
+
+
+
+
         ),
     )
 
