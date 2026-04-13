@@ -1,77 +1,141 @@
-import os
+#!/usr/bin/env python3
 import json
-import time
-import argparse
+import os
+import sys
 from pathlib import Path
+from typing import Any, Optional
+
 from dotenv import load_dotenv
 from langfuse import Langfuse
 
-load_dotenv(Path(__file__).with_name(".env"))
 
-langfuse = Langfuse(
-    public_key=os.getenv("LANGFUSE_PUBLIC_KEY"),
-    secret_key=os.getenv("LANGFUSE_SECRET_KEY"),
-    host=os.getenv("LANGFUSE_BASE_URL"),
-)
+OUTPUT_DIR = Path("langfuse_export")
+TRACE_EXPORTS = [
+    {
+        "label": "regular",
+        "output_file": OUTPUT_DIR / "nestful_traces.jsonl",
+        "tags": ["nestful", "regular-fc"],
+    },
+    {
+        "label": "ptc",
+        "output_file": OUTPUT_DIR / "nestful_traces_ptc.jsonl",
+        "tags": ["nestful", "ptc-fc"],
+    },
+]
+PAGE_SIZE = 100
 
-def to_plain_dict(obj):
-    if hasattr(obj, "model_dump"):
-        return obj.model_dump()
-    if hasattr(obj, "dict"):
-        return obj.dict()
-    if isinstance(obj, dict):
-        return obj
-    return json.loads(json.dumps(obj, default=str))
 
-def write_jsonl(path, rows):
-    with open(path, "w", encoding="utf-8") as f:
-        for row in rows:
-            f.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+def safe_str(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    return str(value)
 
-def fetch_all_traces(tags=None, page_limit=100):
-    all_traces = []
+
+def get_attr(obj: Any, attr_name: str, default: Any = None) -> Any:
+    return getattr(obj, attr_name, default)
+
+
+def normalize_trace_row(trace: Any) -> dict:
+    row = {
+        "id": get_attr(trace, "id"),
+        "name": get_attr(trace, "name"),
+        "session_id": get_attr(trace, "session_id") or get_attr(trace, "sessionId"),
+        "user_id": get_attr(trace, "user_id") or get_attr(trace, "userId"),
+        "environment": get_attr(trace, "environment"),
+        "latency": get_attr(trace, "latency"),
+        "total_cost": get_attr(trace, "total_cost") or get_attr(trace, "totalCost"),
+        "input": get_attr(trace, "input"),
+        "output": get_attr(trace, "output"),
+        "metadata": get_attr(trace, "metadata"),
+        "tags": get_attr(trace, "tags"),
+        "scores": get_attr(trace, "scores"),
+        "observations": get_attr(trace, "observations"),
+        "timestamp": safe_str(get_attr(trace, "timestamp")),
+        "createdAt": safe_str(get_attr(trace, "createdAt") or get_attr(trace, "created_at")),
+        "updatedAt": safe_str(get_attr(trace, "updatedAt") or get_attr(trace, "updated_at")),
+        "release": get_attr(trace, "release"),
+        "version": get_attr(trace, "version"),
+        "public": get_attr(trace, "public"),
+        "externalId": get_attr(trace, "externalId") or get_attr(trace, "external_id"),
+    }
+    return row
+
+
+def export_traces(langfuse: Langfuse, output_file: Path, tags: list[str], label: str) -> None:
+    total_written = 0
     page = 1
 
-    while True:
-        res = langfuse.api.trace.list(
-            page=page,
-            limit=page_limit,
-            tags=tags,
+    with open(output_file, "w", encoding="utf-8") as f:
+        while True:
+            try:
+                response = langfuse.api.trace.list(
+                    page=page,
+                    limit=PAGE_SIZE,
+                    tags=tags,
+                )
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to fetch Langfuse traces for {label} on page {page}: {e}"
+                ) from e
+
+            traces = get_attr(response, "data")
+            if traces is None:
+                raise RuntimeError(
+                    f"Unexpected Langfuse response shape for {label} on page {page}. "
+                    "Expected an object with a .data field."
+                )
+
+            if not traces:
+                break
+
+            print(f"Fetched {label} traces page {page}: {len(traces)}")
+
+            for trace in traces:
+                row = normalize_trace_row(trace)
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                total_written += 1
+
+            if len(traces) < PAGE_SIZE:
+                break
+
+            page += 1
+
+    print(f"Saved {total_written} {label} traces to {output_file}")
+
+
+def main() -> None:
+    load_dotenv()
+
+    public_key = os.getenv("LANGFUSE_PUBLIC_KEY")
+    secret_key = os.getenv("LANGFUSE_SECRET_KEY")
+    host = os.getenv("LANGFUSE_BASE_URL")
+
+    if not public_key or not secret_key or not host:
+        raise ValueError(
+            "Missing Langfuse environment variables. "
+            "Expected LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_BASE_URL in .env"
         )
-        traces = getattr(res, "data", []) or []
 
-        if not traces:
-            break
+    langfuse = Langfuse(
+        public_key=public_key,
+        secret_key=secret_key,
+        host=host,
+    )
 
-        all_traces.extend(traces)
-        print(f"Fetched traces page {page}: {len(traces)}")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-        if len(traces) < page_limit:
-            break
+    for trace_export in TRACE_EXPORTS:
+        export_traces(
+            langfuse=langfuse,
+            output_file=trace_export["output_file"],
+            tags=trace_export["tags"],
+            label=trace_export["label"],
+        )
 
-        page += 1
-        time.sleep(0.1)
-
-    return all_traces
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--output_dir", type=str, default="langfuse_export")
-    parser.add_argument("--page_limit", type=int, default=100)
-    parser.add_argument("--extra_tags", nargs="*", default=[])
-    args = parser.parse_args()
-
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    tags = ["nestful"] + args.extra_tags
-    traces = fetch_all_traces(tags=tags, page_limit=args.page_limit)
-    trace_dicts = [to_plain_dict(t) for t in traces]
-
-    traces_path = output_dir / "nestful_traces.jsonl"
-    write_jsonl(traces_path, trace_dicts)
-
-    print(f"Saved {len(trace_dicts)} traces to {traces_path}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        sys.exit(1)
