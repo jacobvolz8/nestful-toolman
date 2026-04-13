@@ -4,7 +4,25 @@ from utils import *
 from output_parsers import *
 from sklearn.metrics import accuracy_score
 from pathlib import Path
+import time
+from langfuse import Langfuse
+from dotenv import load_dotenv
 
+load_dotenv(Path(__file__).with_name(".env"))
+
+
+LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY")
+LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY")
+LANGFUSE_BASE_URL = os.getenv("LANGFUSE_BASE_URL")
+
+if not LANGFUSE_SECRET_KEY or not LANGFUSE_PUBLIC_KEY or not LANGFUSE_BASE_URL:
+    raise ValueError("Missing Langfuse environment variables in .env")
+
+langfuse = Langfuse(
+    public_key=LANGFUSE_PUBLIC_KEY,
+    secret_key=LANGFUSE_SECRET_KEY,
+    host=LANGFUSE_BASE_URL,
+)
 
 def handler(signum, frame): 
     raise TimeoutError("Time limit exceeded!") 
@@ -31,6 +49,8 @@ LLAMA_MODELS = [
     "Llama-3.2-90B-Vision-Instruct"
 ]
 
+
+
 def listit(t):
     return list(map(listit, t)) if isinstance(t, (list, tuple)) else t
 
@@ -43,6 +63,136 @@ def get_basic_func_list(basic_func_file_path):
             func_name = func_str[:func_str.index('(')]
             func_names.append(func_name)
     return func_names
+
+
+def normalize_ref(v):
+    if isinstance(v, str) and v.startswith("$") and not v.endswith("$"):
+        return v + "$"
+    return v
+
+def normalize_call(call):
+    args = {}
+    for k, v in call.get("arguments", {}).items():
+        args[k] = normalize_ref(v)
+    return {
+        "name": call.get("name"),
+        "arguments": args
+    }
+
+def safe_load_calls(func_calls):
+    out = []
+    for f in func_calls:
+        if not f:
+            continue
+        try:
+            d = json.loads(f.replace('<|endoftext|>', '').strip()) if isinstance(f, str) else f
+            if d.get("name") == "dummy":
+                continue
+            out.append(normalize_call(d))
+        except:
+            return None
+    return out
+
+
+def find_unexpected_pred_items(pred_calls, gold_calls):
+    if not pred_calls or not gold_calls:
+        return {"unexpected_tools": [], "unexpected_arguments": []}
+
+    gold_tool_names = {call["name"] for call in gold_calls if call.get("name")}
+    gold_args_by_tool = {}
+    for call in gold_calls:
+        tool_name = call.get("name")
+        if not tool_name:
+            continue
+        gold_args_by_tool.setdefault(tool_name, set()).update(call.get("arguments", {}).keys())
+
+    unexpected_tools = sorted(
+        {call["name"] for call in pred_calls if call.get("name") not in gold_tool_names}
+    )
+
+    unexpected_arguments = set()
+    for call in pred_calls:
+        tool_name = call.get("name")
+        pred_arg_names = set(call.get("arguments", {}).keys())
+        gold_arg_names = gold_args_by_tool.get(tool_name, set())
+        for arg_name in pred_arg_names - gold_arg_names:
+            unexpected_arguments.add(f"{tool_name}.{arg_name}")
+
+    return {
+        "unexpected_tools": unexpected_tools,
+        "unexpected_arguments": sorted(unexpected_arguments),
+    }
+
+
+def compare_sequences(pred_calls, gold_calls):
+    if pred_calls is None or gold_calls is None:
+        return {
+            "type": "parsing_error",
+            "matched_prefix_len": 0,
+            "unexpected_tools": [],
+            "unexpected_arguments": [],
+        }
+
+    extras = find_unexpected_pred_items(pred_calls, gold_calls)
+
+    min_len = min(len(pred_calls), len(gold_calls))
+    first_mismatch = None
+
+    for i in range(min_len):
+        pred = pred_calls[i]
+        gold = gold_calls[i]
+
+        if pred["name"] != gold["name"]:
+            first_mismatch = {
+                "index": i,
+                "kind": "tool"
+            }
+            break
+
+        if pred["arguments"] != gold["arguments"]:
+            first_mismatch = {
+                "index": i,
+                "kind": "arguments"
+            }
+            break
+
+    if first_mismatch is None:
+        if len(pred_calls) == len(gold_calls):
+            return {
+                "type": "exact_match",
+                "matched_prefix_len": len(gold_calls),
+                **extras,
+            }
+        elif len(pred_calls) < len(gold_calls):
+            return {
+                "type": "stopped_early",
+                "matched_prefix_len": min_len,
+                **extras,
+            }
+        else:
+            return {
+                "type": "extra_calls",
+                "matched_prefix_len": min_len,
+                **extras,
+            }
+
+    i = first_mismatch["index"]
+    kind = first_mismatch["kind"]
+
+    if i == 0:
+        if kind == "tool":
+            return {"type": "wrong_first_tool", "matched_prefix_len": 0, **extras}
+        else:
+            return {"type": "wrong_first_arguments", "matched_prefix_len": 0, **extras}
+    else:
+        if kind == "tool":
+            return {"type": "starts_correct_then_wrong_tool", "matched_prefix_len": i, **extras}
+        else:
+            return {"type": "starts_correct_then_wrong_arguments", "matched_prefix_len": i, **extras}
+    
+    
+
+
 
 def calculate_ans(func_calls, spec_lib, executable_func_dir):
     signal.signal(signal.SIGALRM, handler) 
@@ -149,7 +299,147 @@ def get_alter_traj_scores(win_rate, acc_comb):
     print(sc)
     return sc
 
-def calculate_scores(predictions, model_name, executable_func_dir, intents_only=False, win_rate_flag=True, alt_traj_flag = True):
+
+def make_trace_tags(sample_id, ptc_enabled, model_name, model_provider):
+    ptc_flag = "ptc-fc" if ptc_enabled else "regular-fc"
+    return [
+        "nestful",
+        sample_id,
+        ptc_flag,
+        model_name,
+        model_provider,
+    ]
+
+
+def get_trace_id_by_tags(sample_id, ptc_enabled, model_name, model_provider, retries=3, sleep_seconds=5):
+    tags = make_trace_tags(sample_id, ptc_enabled, model_name, model_provider)
+    #print("run key", run_key)
+    """
+    Look up the Langfuse trace by tag and return its trace_id.
+    """
+    for attempt in range(retries):
+        try:
+            traces = langfuse.api.trace.list(
+                page=1,
+                limit=10,
+                tags=tags,
+            ).data
+
+            if traces:
+                # should normally be unique; take first match
+                return traces[0].id
+
+        except Exception as e:
+            print(f"[Langfuse lookup error] {tags}: {e}")
+
+        if attempt < retries - 1:
+            time.sleep(sleep_seconds)
+
+    return None
+
+
+def add_langfuse_scores(trace_id, sample_id, cmp_type, accuracy_combined, win_score,
+    f1_intent=None, f1_slot=None, unexpected_tools=None, unexpected_arguments=None):
+    """
+    Attach per-sample scores to an existing Langfuse trace.
+    """
+    unexpected_tools = unexpected_tools or []
+    unexpected_arguments = unexpected_arguments or []
+
+    try:
+        langfuse.create_score(
+            trace_id=trace_id,
+            name="nestful_exact_match",
+            value=1.0 if cmp_type == "exact_match" else 0.0,
+            data_type="NUMERIC",
+            comment=f"sample_id={sample_id}",
+        )
+
+        langfuse.create_score(
+            trace_id=trace_id,
+            name="nestful_partial_match_accuracy",
+            value=float(accuracy_combined),
+            data_type="NUMERIC",
+            comment=f"sample_id={sample_id}",
+        )
+
+        langfuse.create_score(
+            trace_id=trace_id,
+            name="nestful_error_type",
+            value=cmp_type,
+            data_type="CATEGORICAL",
+            comment=f"sample_id={sample_id}",
+        )
+
+        langfuse.create_score(
+            trace_id=trace_id,
+            name="nestful_win",
+            value=1.0 if win_score else 0.0,
+            data_type="NUMERIC",
+            comment=f"sample_id={sample_id}",
+        )
+
+        if f1_intent is not None:
+            langfuse.create_score(
+                trace_id=trace_id,
+                name="nestful_f1_intent",
+                value=float(f1_intent),
+                data_type="NUMERIC",
+                comment=f"sample_id={sample_id}",
+            )
+
+        if f1_slot is not None:
+            langfuse.create_score(
+                trace_id=trace_id,
+                name="nestful_f1_slot",
+                value=float(f1_slot),
+                data_type="NUMERIC",
+                comment=f"sample_id={sample_id}",
+            )
+
+        langfuse.create_score(
+            trace_id=trace_id,
+            name="pred_contains_unexpected_tool",
+            value=1.0 if unexpected_tools else 0.0,
+            data_type="NUMERIC",
+            comment=f"sample_id={sample_id}; unexpected_tools={unexpected_tools}",
+        )
+
+        langfuse.create_score(
+            trace_id=trace_id,
+            name="pred_contains_unexpected_argument",
+            value=1.0 if unexpected_arguments else 0.0,
+            data_type="NUMERIC",
+            comment=f"sample_id={sample_id}; unexpected_arguments={unexpected_arguments}",
+        )
+
+    except Exception as e:
+        print(f"[Langfuse scoring error] trace_id={trace_id}, sample_id={sample_id}: {e}")
+
+
+def add_langfuse_benchmark_f1_scores(trace_id, f1_intent, f1_slot):
+    try:
+        langfuse.create_score(
+            trace_id=trace_id,
+            name="nestful_f1_intent",
+            value=float(f1_intent),
+            data_type="NUMERIC",
+            comment="benchmark_metric=true",
+        )
+
+        langfuse.create_score(
+            trace_id=trace_id,
+            name="nestful_f1_slot",
+            value=float(f1_slot),
+            data_type="NUMERIC",
+            comment="benchmark_metric=true",
+        )
+    except Exception as e:
+        print(f"[Langfuse benchmark scoring error] trace_id={trace_id}: {e}")
+
+
+def calculate_scores(predictions, model_name, executable_func_dir, intents_only=False, win_rate_flag=True, alt_traj_flag = True, add_langfuse_scores_flag=True,
+    ptc_enabled=False,):
     gold_output_intent = []
     pred_output_intent = []
     gold_output_slot = []
@@ -162,6 +452,20 @@ def calculate_scores(predictions, model_name, executable_func_dir, intents_only=
     all_accuracy_combined = []
     all_num_times_full_score = 0
     win_rate_list = []
+    matched_trace_ids = set()
+
+    analysis_counts = {
+    "exact_match": 0,
+    "wrong_first_tool": 0,
+    "wrong_first_arguments": 0,
+    "starts_correct_then_wrong_tool": 0,
+    "starts_correct_then_wrong_arguments": 0,
+    "stopped_early": 0,
+    "extra_calls": 0,
+    "parsing_error": 0,
+    "pred_contains_unexpected_tool": 0,
+    "pred_contains_unexpected_argument": 0,
+}
 
     num_pred_examples_w_parsing_errors = 0
     for item in tqdm(predictions):
@@ -191,6 +495,16 @@ def calculate_scores(predictions, model_name, executable_func_dir, intents_only=
             pred_func_calls, gold_func_calls, pred_dict_list, gold_dict_list, num_errors_parsing_pred_intent, pred_has_parsing_errors = parse_deepseek_output(item, num_errors_parsing_pred_intent)
         else:
             raise Exception("model not handled")
+        
+        pred_calls_norm = safe_load_calls(pred_func_calls)
+        gold_calls_norm = safe_load_calls(gold_func_calls)
+
+        cmp = compare_sequences(pred_calls_norm, gold_calls_norm)
+        analysis_counts[cmp["type"]] = analysis_counts.get(cmp["type"], 0) + 1
+        if cmp.get("unexpected_tools"):
+            analysis_counts["pred_contains_unexpected_tool"] += 1
+        if cmp.get("unexpected_arguments"):
+            analysis_counts["pred_contains_unexpected_argument"] += 1
 
         gold_apis_names, pred_apis_names = [], []
         for f in pred_func_calls:
@@ -296,9 +610,44 @@ def calculate_scores(predictions, model_name, executable_func_dir, intents_only=
         if win_rate_flag:
             win_score = calculate_win_score(pred_dict_list, item["gold_answer"], item["tools"], executable_func_dir)
             win_rate_list.append(win_score)
+        else:
+            win_score = False
+
+        if add_langfuse_scores_flag:
+            sample_id = item.get("sample_id")
+
+            if sample_id:
+                trace_id = get_trace_id_by_tags(
+                    sample_id=sample_id,
+                    ptc_enabled=ptc_enabled,
+                    model_name="gpt-5-mini-2025-08-07",
+                    model_provider="OpenAI",
+                )
+
+                if trace_id:
+                    matched_trace_ids.add(trace_id)
+                    add_langfuse_scores(
+                        trace_id=trace_id,
+                        sample_id=sample_id,
+                        cmp_type=cmp["type"],
+                        accuracy_combined=accuracy_combined,
+                        win_score=bool(win_score),
+                        unexpected_tools=cmp.get("unexpected_tools"),
+                        unexpected_arguments=cmp.get("unexpected_arguments"),
+                    )
+                else:
+                    print(f"[Langfuse] No trace found for sample_id={sample_id}, ptc_enabled={ptc_enabled}, model={model_name}")
 
     p_intent, r_intent, f1_intent = compute_score_sklearn(gold_output_intent, pred_output_intent)
     p_slot, r_slot, f1_slot = compute_score_sklearn(gold_output_slot, pred_output_slot)
+
+    if add_langfuse_scores_flag:
+        for trace_id in matched_trace_ids:
+            add_langfuse_benchmark_f1_scores(
+                trace_id=trace_id,
+                f1_intent=f1_intent,
+                f1_slot=f1_slot,
+            )
 
     return {
         "p_intent": "{:.3f}".format(p_intent),
@@ -315,7 +664,8 @@ def calculate_scores(predictions, model_name, executable_func_dir, intents_only=
         'num_errors_parsing_gold_intent': num_errors_parsing_gold_intent,
         'num_errors_parsing_pred_slot': num_errors_parsing_pred_slot,
         'num_errors_parsing_gold_slot': num_errors_parsing_gold_slot,
-        'num_pred_examples_w_parsing_errors': num_pred_examples_w_parsing_errors
+        'num_pred_examples_w_parsing_errors': num_pred_examples_w_parsing_errors,
+        'analysis_counts': analysis_counts
     }    
 
 def print_result(result, model):
@@ -330,6 +680,11 @@ def print_result(result, model):
     print(f"Full Match Accuracy: {result['percentage_times_full_score']}")
     print(f"Win Rate: {result['win_rate']}")
     print("-"*100)
+    if "analysis_counts" in result:
+        total = result["num_examples"]
+        print("Error analysis:")
+        for k, v in result["analysis_counts"].items():
+            print(f"{k}: {v} / {total} ({v/total:.3%})")
 
 def calculate_weighted_avg_score(res_lst):
     f1_intent_total = 0
@@ -366,8 +721,11 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, default="granite-3.0-8b-instruct")
     parser.add_argument("--result_file_path", type=str,  default="results/nestful_3/gpt-4o-mini-nestful/output.jsonl")
     parser.add_argument("--executable_func_dir", type=str,  default="data_v2/executable_functions")
+    parser.add_argument("--ptc_enabled", action="store_true")
+    parser.add_argument("--add_langfuse_scores", action="store_true")
     args = parser.parse_args()
-
+    print(args.ptc_enabled)
     data = read_jsonlines(args.result_file_path)
-    result = calculate_scores(data, args.model_name, args.executable_func_dir)
+    result = calculate_scores(data, args.model_name, args.executable_func_dir, ptc_enabled=args.ptc_enabled,
+        add_langfuse_scores_flag=args.add_langfuse_scores,)
     print_result(result, args.model_name)

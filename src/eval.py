@@ -35,7 +35,7 @@ def _proxy_generate(prompts, *, proxy_url, model_fqn, temperature, max_tokens, t
         raise RuntimeError(f"LLM proxy response had no texts. Keys: {list(parsed.keys())}")
     return [t.strip() for t in texts]
 
-def _proxy_nestful(query, tools, *, proxy_url, model_fqn, temperature, max_tokens, batch_size, enable_ptc=False, tool_choice="required", system_prompt="", js_extract_timeout_ms=None, timeout=600):
+def _proxy_nestful(query, tools, test_id, *, proxy_url, model_fqn, temperature, max_tokens, batch_size, enable_ptc=False, tool_choice="required", system_prompt="", js_extract_timeout_ms=None, timeout=600):
     import urllib.request
     import urllib.error
 
@@ -50,6 +50,7 @@ def _proxy_nestful(query, tools, *, proxy_url, model_fqn, temperature, max_token
         "system_prompt": system_prompt or "",
         "enable_ptc": bool(enable_ptc),
         "tool_choice": tool_choice or "required",
+        "test_id": test_id, 
     }
     if js_extract_timeout_ms is not None:
         payload["js_extract_timeout_ms"] = int(js_extract_timeout_ms)
@@ -96,10 +97,12 @@ def eval_code(args):
         def run_one(local_idx, sample):
             query = sample.get("input", "")
             tools_spec = sample.get("tools") or []
+            test_id = sample.get("sample_id")
 
             gen_text = _proxy_nestful(
                 query,
                 tools_spec,
+                test_id,
                 proxy_url=args.llm_proxy_url,
                 model_fqn=model_fqn,
                 temperature=args.temperature,
@@ -152,7 +155,7 @@ def eval_code(args):
                             f"({completed_total}/{count_total} total)..."
                         )
 
-            save_path = os.path.join(save_dir, f"output_test_{part_num}.jsonl")
+            save_path = os.path.join(save_dir, f"test_output_without_PTC_{part_num}.jsonl")
             print(f"### Saving chunk {part_num} to: {save_path}")
             write_jsonlines(chunk_results, save_path)
 
@@ -280,7 +283,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--enable_ptc",
         type=lambda x: str(x).lower() in ("1", "true", "t", "yes", "y"),
-        default=True,
+        default=False,
         help="If true, sets enable_ptc=true for /nestful calls",
     )
     parser.add_argument(
