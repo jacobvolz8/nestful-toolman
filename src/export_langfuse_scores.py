@@ -9,19 +9,20 @@ from dotenv import load_dotenv
 from langfuse import Langfuse
 
 
-OUTPUT_DIR = Path("langfuse_export")
-OUTPUT_FILE = OUTPUT_DIR / "nestful_scores.jsonl"
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+OUTPUT_DIR = PROJECT_ROOT / "langfuse_export"
 PAGE_SIZE = 100
-TRACE_EXPORTS = [
-    {
-        "label": "regular",
-        "tags": ["nestful", "regular-fc"],
-    },
-    {
-        "label": "ptc",
-        "tags": ["nestful", "ptc-fc"],
-    },
-]
+
+# Export exactly one mode at a time by toggling these constants.
+#PTC_FLAG = True
+#OUTPUT_FILE = OUTPUT_DIR / "nestful_scores_ptc.jsonl"
+PTC_FLAG = False
+OUTPUT_FILE = OUTPUT_DIR / "nestful_scores_non_ptc.jsonl"
+
+TRACE_EXPORT = {
+    "label": "ptc" if PTC_FLAG else "regular",
+    "tags": ["nestful", "ptc-fc"] if PTC_FLAG else ["nestful", "regular-fc"],
+}
 
 
 def safe_str(value: Any) -> Optional[str]:
@@ -47,13 +48,20 @@ def normalize_score_row(score: Any) -> dict:
 
     observation_id = get_attr(score, "observation_id") or get_attr(score, "observationId")
 
+    data_type = get_attr(score, "data_type") or get_attr(score, "dataType")
     value = get_attr(score, "value")
+    if data_type == "CATEGORICAL" and value is not None:
+        # Langfuse stores the human-readable category separately and `value`
+        # can be a numeric category mapping (often 0.0 without a config).
+        value = get_attr(score, "string_value") or get_attr(score, "stringValue") or value
+    elif data_type == "BOOLEAN" and value is None:
+        value = get_attr(score, "string_value") or get_attr(score, "stringValue")
     if value is None:
         value = get_attr(score, "numeric_value")
     if value is None:
         value = get_attr(score, "numericValue")
-
-    data_type = get_attr(score, "data_type") or get_attr(score, "dataType")
+    if data_type == "CATEGORICAL" and value is None:
+        value = get_attr(score, "string_value") or get_attr(score, "stringValue")
 
     row = {
         "id": get_attr(score, "id"),
@@ -112,6 +120,7 @@ def fetch_all_scores(langfuse: Langfuse) -> list[dict]:
 
     while True:
         response = langfuse.api.scores.get_many(page=page, limit=PAGE_SIZE)
+        #response = langfuse.api.scores.list(page=page, limit=PAGE_SIZE)
         scores = get_attr(response, "data")
         if scores is None:
             raise RuntimeError(
@@ -159,16 +168,11 @@ def main() -> None:
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    trace_ids_by_mode: dict[str, set[str]] = {}
-    combined_trace_ids: set[str] = set()
-    for export_cfg in TRACE_EXPORTS:
-        trace_ids = fetch_trace_ids(langfuse, export_cfg["tags"], export_cfg["label"])
-        trace_ids_by_mode[export_cfg["label"]] = trace_ids
-        combined_trace_ids.update(trace_ids)
-        print(f"Found {len(trace_ids)} {export_cfg['label']} trace ids")
+    trace_ids = fetch_trace_ids(langfuse, TRACE_EXPORT["tags"], TRACE_EXPORT["label"])
+    print(f"Found {len(trace_ids)} {TRACE_EXPORT['label']} trace ids")
 
     all_scores = fetch_all_scores(langfuse)
-    filtered_scores = [row for row in all_scores if row.get("traceId") in combined_trace_ids]
+    filtered_scores = [row for row in all_scores if row.get("traceId") in trace_ids]
 
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         for row in filtered_scores:

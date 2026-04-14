@@ -4,6 +4,11 @@ from instruct_data_prep import get_instruct_data
 import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+DATA_FILE = "nestful_data._small.jsonl"
+PTC_FLAG = True
+OUTPUT_PATH = "test_output_with_PTC_"
+#OUTPUT_PATH = "test_output_without_PTC_"
+
 def _proxy_generate(prompts, *, proxy_url, model_fqn, temperature, max_tokens, timeout=600):
     import urllib.request
     import urllib.error
@@ -155,7 +160,7 @@ def eval_code(args):
                             f"({completed_total}/{count_total} total)..."
                         )
 
-            save_path = os.path.join(save_dir, f"test_output_without_PTC_{part_num}.jsonl")
+            save_path = os.path.join(save_dir, f"{OUTPUT_PATH}{part_num}.jsonl")
             print(f"### Saving chunk {part_num} to: {save_path}")
             write_jsonlines(chunk_results, save_path)
 
@@ -247,7 +252,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     default_dataset = os.path.abspath(
-        os.path.join(os.path.dirname(__file__), "..", "data_v2", "nestful_data._small.jsonl")
+        os.path.join(os.path.dirname(__file__), "..", "data_v2", DATA_FILE)
     )
 
     parser.add_argument(
@@ -283,7 +288,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--enable_ptc",
         type=lambda x: str(x).lower() in ("1", "true", "t", "yes", "y"),
-        default=False,
+        default=PTC_FLAG,
         help="If true, sets enable_ptc=true for /nestful calls",
     )
     parser.add_argument(

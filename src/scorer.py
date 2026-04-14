@@ -311,9 +311,36 @@ def make_trace_tags(sample_id, ptc_enabled, model_name, model_provider):
     ]
 
 
+def get_trace_attr(trace, key, default=None):
+    metadata = getattr(trace, "metadata", None) or {}
+    attributes = metadata.get("attributes", {}) if isinstance(metadata, dict) else {}
+    return attributes.get(key, default)
+
+
+def trace_matches_expected(trace, sample_id, ptc_enabled, model_name, model_provider):
+    expected_ptc = "true" if ptc_enabled else "false"
+    expected_tags = set(make_trace_tags(sample_id, ptc_enabled, model_name, model_provider))
+    trace_tags = set(getattr(trace, "tags", []) or [])
+
+    trace_sample_id = get_trace_attr(trace, "benchmark.sample_id", getattr(trace, "name", None))
+    trace_ptc = str(get_trace_attr(trace, "ptc.enabled", "")).lower()
+    trace_model = get_trace_attr(trace, "gen_ai.request.model", "")
+
+    accepted_models = {
+        model_name,
+        f"{model_provider}/{model_name}",
+    }
+
+    return (
+        trace_sample_id == sample_id
+        and trace_ptc == expected_ptc
+        and trace_model in accepted_models
+        and expected_tags.issubset(trace_tags)
+    )
+
+
 def get_trace_id_by_tags(sample_id, ptc_enabled, model_name, model_provider, retries=3, sleep_seconds=5):
     tags = make_trace_tags(sample_id, ptc_enabled, model_name, model_provider)
-    #print("run key", run_key)
     """
     Look up the Langfuse trace by tag and return its trace_id.
     """
@@ -325,9 +352,29 @@ def get_trace_id_by_tags(sample_id, ptc_enabled, model_name, model_provider, ret
                 tags=tags,
             ).data
 
+            exact_matches = [
+                trace for trace in traces
+                if trace_matches_expected(trace, sample_id, ptc_enabled, model_name, model_provider)
+            ]
+
+            if len(exact_matches) == 1:               
+                return exact_matches[0].id
+
+            if len(exact_matches) > 1:
+                print(
+                    f"[Langfuse lookup error] Multiple exact trace matches for "
+                    f"sample_id={sample_id}, ptc_enabled={ptc_enabled}, "
+                    f"model={model_provider}/{model_name}: {[trace.id for trace in exact_matches]}"
+                )
+                return None
+
             if traces:
-                # should normally be unique; take first match
-                return traces[0].id
+                print(
+                    f"[Langfuse lookup error] No exact trace match for "
+                    f"sample_id={sample_id}, ptc_enabled={ptc_enabled}, "
+                    f"model={model_provider}/{model_name}. "
+                    f"Candidate traces: {[trace.id for trace in traces]}"
+                )
 
         except Exception as e:
             print(f"[Langfuse lookup error] {tags}: {e}")
@@ -339,7 +386,7 @@ def get_trace_id_by_tags(sample_id, ptc_enabled, model_name, model_provider, ret
 
 
 def add_langfuse_scores(trace_id, sample_id, cmp_type, accuracy_combined, win_score,
-    f1_intent=None, f1_slot=None, unexpected_tools=None, unexpected_arguments=None):
+    unexpected_tools=None, unexpected_arguments=None):
     """
     Attach per-sample scores to an existing Langfuse trace.
     """
@@ -379,24 +426,6 @@ def add_langfuse_scores(trace_id, sample_id, cmp_type, accuracy_combined, win_sc
             comment=f"sample_id={sample_id}",
         )
 
-        if f1_intent is not None:
-            langfuse.create_score(
-                trace_id=trace_id,
-                name="nestful_f1_intent",
-                value=float(f1_intent),
-                data_type="NUMERIC",
-                comment=f"sample_id={sample_id}",
-            )
-
-        if f1_slot is not None:
-            langfuse.create_score(
-                trace_id=trace_id,
-                name="nestful_f1_slot",
-                value=float(f1_slot),
-                data_type="NUMERIC",
-                comment=f"sample_id={sample_id}",
-            )
-
         langfuse.create_score(
             trace_id=trace_id,
             name="pred_contains_unexpected_tool",
@@ -416,28 +445,6 @@ def add_langfuse_scores(trace_id, sample_id, cmp_type, accuracy_combined, win_sc
     except Exception as e:
         print(f"[Langfuse scoring error] trace_id={trace_id}, sample_id={sample_id}: {e}")
 
-
-def add_langfuse_benchmark_f1_scores(trace_id, f1_intent, f1_slot):
-    try:
-        langfuse.create_score(
-            trace_id=trace_id,
-            name="nestful_f1_intent",
-            value=float(f1_intent),
-            data_type="NUMERIC",
-            comment="benchmark_metric=true",
-        )
-
-        langfuse.create_score(
-            trace_id=trace_id,
-            name="nestful_f1_slot",
-            value=float(f1_slot),
-            data_type="NUMERIC",
-            comment="benchmark_metric=true",
-        )
-    except Exception as e:
-        print(f"[Langfuse benchmark scoring error] trace_id={trace_id}: {e}")
-
-
 def calculate_scores(predictions, model_name, executable_func_dir, intents_only=False, win_rate_flag=True, alt_traj_flag = True, add_langfuse_scores_flag=True,
     ptc_enabled=False,):
     gold_output_intent = []
@@ -452,8 +459,6 @@ def calculate_scores(predictions, model_name, executable_func_dir, intents_only=
     all_accuracy_combined = []
     all_num_times_full_score = 0
     win_rate_list = []
-    matched_trace_ids = set()
-
     analysis_counts = {
     "exact_match": 0,
     "wrong_first_tool": 0,
@@ -625,7 +630,6 @@ def calculate_scores(predictions, model_name, executable_func_dir, intents_only=
                 )
 
                 if trace_id:
-                    matched_trace_ids.add(trace_id)
                     add_langfuse_scores(
                         trace_id=trace_id,
                         sample_id=sample_id,
@@ -640,14 +644,6 @@ def calculate_scores(predictions, model_name, executable_func_dir, intents_only=
 
     p_intent, r_intent, f1_intent = compute_score_sklearn(gold_output_intent, pred_output_intent)
     p_slot, r_slot, f1_slot = compute_score_sklearn(gold_output_slot, pred_output_slot)
-
-    if add_langfuse_scores_flag:
-        for trace_id in matched_trace_ids:
-            add_langfuse_benchmark_f1_scores(
-                trace_id=trace_id,
-                f1_intent=f1_intent,
-                f1_slot=f1_slot,
-            )
 
     return {
         "p_intent": "{:.3f}".format(p_intent),
@@ -728,4 +724,7 @@ if __name__ == "__main__":
     data = read_jsonlines(args.result_file_path)
     result = calculate_scores(data, args.model_name, args.executable_func_dir, ptc_enabled=args.ptc_enabled,
         add_langfuse_scores_flag=args.add_langfuse_scores,)
+    if args.add_langfuse_scores:
+        langfuse.flush()
+        langfuse.shutdown()
     print_result(result, args.model_name)
