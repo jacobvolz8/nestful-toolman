@@ -18,14 +18,21 @@ LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY")
 LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY")
 LANGFUSE_BASE_URL = os.getenv("LANGFUSE_BASE_URL")
 
-if not LANGFUSE_SECRET_KEY or not LANGFUSE_PUBLIC_KEY or not LANGFUSE_BASE_URL:
-    raise ValueError("Missing Langfuse environment variables in .env")
+langfuse = None
 
-langfuse = Langfuse(
-    public_key=LANGFUSE_PUBLIC_KEY,
-    secret_key=LANGFUSE_SECRET_KEY,
-    host=LANGFUSE_BASE_URL,
-)
+
+def get_langfuse_client():
+    global langfuse
+    if langfuse is not None:
+        return langfuse
+    if not LANGFUSE_SECRET_KEY or not LANGFUSE_PUBLIC_KEY or not LANGFUSE_BASE_URL:
+        raise ValueError("Missing Langfuse environment variables in .env")
+    langfuse = Langfuse(
+        public_key=LANGFUSE_PUBLIC_KEY,
+        secret_key=LANGFUSE_SECRET_KEY,
+        host=LANGFUSE_BASE_URL,
+    )
+    return langfuse
 
 def handler(signum, frame): 
     raise TimeoutError("Time limit exceeded!") 
@@ -374,37 +381,44 @@ def trace_matches_expected(trace, sample_id, ptc_enabled, model_name, model_prov
     )
 
 
+def get_trace_timestamp(trace):
+    for attr_name in ("timestamp", "created_at", "createdAt", "start_time", "startTime"):
+        value = getattr(trace, attr_name, None)
+        if value:
+            return str(value)
+    return ""
+
+
 def get_trace_id_by_tags(sample_id, ptc_enabled, model_name, model_provider, retries=3, sleep_seconds=5):
     tags = make_trace_tags(sample_id, ptc_enabled, model_name, model_provider)
     """
     Look up the Langfuse trace by tag and return its trace_id.
     """
+    client = get_langfuse_client()
     for attempt in range(retries):
         try:
-            traces = langfuse.api.trace.list(
-                limit=1,
+            traces = client.api.trace.list(
+                page=1,
+                limit=100,
                 tags=tags,
             ).data
-            #print(f"[Lookup] sample_id={sample_id}, ptc_enabled={ptc_enabled}, tags={tags}, num_traces={len(traces)}")
-            #exact_matches = [
-            #    trace for trace in traces
-            #    if trace_matches_expected(trace, sample_id, ptc_enabled, model_name, model_provider)
-            #]
+            exact_matches = [
+                trace for trace in traces
+                if trace_matches_expected(trace, sample_id, ptc_enabled, model_name, model_provider)
+            ]
 
-            if len(traces) == 1:
-                print("trace id: ", traces[0].id)               
-                return traces[0].id
-            
-            if len(traces) == 0:
-                print("No trace found")
+            if len(exact_matches) == 1:
+                return exact_matches[0].id
 
-            if len(traces) > 1:
+            if len(exact_matches) > 1:
+                exact_matches.sort(key=get_trace_timestamp, reverse=True)
                 print(
                     f"[Langfuse lookup error] Multiple exact trace matches for "
                     f"sample_id={sample_id}, ptc_enabled={ptc_enabled}, "
-                    f"model={model_provider}/{model_name}: {[trace.id for trace in traces]}"
+                    f"model={model_provider}/{model_name}: {[trace.id for trace in exact_matches]}. "
+                    f"Using latest trace {exact_matches[0].id}."
                 )
-                return None
+                return exact_matches[0].id
 
             if traces:
                 print(
@@ -482,8 +496,33 @@ def add_langfuse_scores(trace_id, sample_id, cmp_type, accuracy_combined, win_sc
     except Exception as e:
         print(f"[Langfuse scoring error] trace_id={trace_id}, sample_id={sample_id}: {e}")
 
+def build_scoring_record(sample_id, ptc_enabled, cmp, accuracy_combined, win_score, eval_model_name):
+    return {
+        "sample_id": sample_id,
+        "ptc_enabled": bool(ptc_enabled),
+        "toolman_model_name": TOOLMAN_MODEL_NAME,
+        "toolman_model_provider": TOOLMAN_MODEL_PROVIDER,
+        "eval_model_name": eval_model_name,
+        "cmp_type": cmp["type"],
+        "accuracy_combined": float(accuracy_combined),
+        "win_score": bool(win_score),
+        "unexpected_tools": cmp.get("unexpected_tools") or [],
+        "unexpected_arguments": cmp.get("unexpected_arguments") or [],
+    }
+
+
+def write_jsonl(path, rows):
+    if not path:
+        return
+    output_path = Path(path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8") as f:
+        for row in rows:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def calculate_scores(predictions, model_name, executable_func_dir, intents_only=False, win_rate_flag=True, alt_traj_flag = True, add_langfuse_scores_flag=True,
-    ptc_enabled=False,):
+    ptc_enabled=False, scoring_records_output_path=None):
     gold_output_intent = []
     pred_output_intent = []
     gold_output_slot = []
@@ -510,6 +549,7 @@ def calculate_scores(predictions, model_name, executable_func_dir, intents_only=
 }
 
     num_pred_examples_w_parsing_errors = 0
+    scoring_records = []
     for item in tqdm(predictions):
         pred_has_parsing_errors = False
         pred_func_calls, gold_func_calls = [], []
@@ -655,9 +695,20 @@ def calculate_scores(predictions, model_name, executable_func_dir, intents_only=
         else:
             win_score = False
 
-        if add_langfuse_scores_flag:
-            sample_id = item.get("sample_id")
+        sample_id = item.get("sample_id")
+        if sample_id:
+            scoring_records.append(
+                build_scoring_record(
+                    sample_id=sample_id,
+                    ptc_enabled=ptc_enabled,
+                    cmp=cmp,
+                    accuracy_combined=accuracy_combined,
+                    win_score=win_score,
+                    eval_model_name=model_name,
+                )
+            )
 
+        if add_langfuse_scores_flag:
             if sample_id:
                 trace_id = get_trace_id_by_tags(
                     sample_id=sample_id,
@@ -678,6 +729,8 @@ def calculate_scores(predictions, model_name, executable_func_dir, intents_only=
                     )
                 else:
                     print(f"[Langfuse] No trace found for sample_id={sample_id}, ptc_enabled={ptc_enabled}, model={model_name}")
+
+    write_jsonl(scoring_records_output_path, scoring_records)
 
     p_intent, r_intent, f1_intent = compute_score_sklearn(gold_output_intent, pred_output_intent)
     p_slot, r_slot, f1_slot = compute_score_sklearn(gold_output_slot, pred_output_slot)
@@ -756,12 +809,14 @@ if __name__ == "__main__":
     parser.add_argument("--executable_func_dir", type=str,  default="data_v2/executable_functions")
     parser.add_argument("--ptc_enabled", action="store_true")
     parser.add_argument("--add_langfuse_scores", action="store_true")
+    parser.add_argument("--scoring_records_output_path", type=str, default=None)
     args = parser.parse_args()
     print(args.ptc_enabled)
     data = read_jsonlines(args.result_file_path)
     result = calculate_scores(data, args.model_name, args.executable_func_dir, ptc_enabled=args.ptc_enabled,
-        add_langfuse_scores_flag=args.add_langfuse_scores,)
+        add_langfuse_scores_flag=args.add_langfuse_scores, scoring_records_output_path=args.scoring_records_output_path)
     if args.add_langfuse_scores:
-        langfuse.flush()
-        langfuse.shutdown()
+        client = get_langfuse_client()
+        client.flush()
+        client.shutdown()
     print_result(result, args.model_name)
