@@ -10,6 +10,9 @@ from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).with_name(".env"))
 
+TOOLMAN_MODEL_NAME="gpt-5-mini-2025-08-07"
+TOOLMAN_MODEL_PROVIDER="OpenAI"
+
 
 LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY")
 LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY")
@@ -48,6 +51,8 @@ LLAMA_MODELS = [
     "Llama-3.2-11B-Vision-Instruct",
     "Llama-3.2-90B-Vision-Instruct"
 ]
+
+
 
 
 
@@ -255,7 +260,7 @@ def calculate_ans(func_calls, spec_lib, executable_func_dir):
     
     except TimeoutError: 
         print("The program timed out!") 
-        signal.alarm(0)
+        #signal.alarm(0)
         return False
     
     except Exception as e:
@@ -264,6 +269,8 @@ def calculate_ans(func_calls, spec_lib, executable_func_dir):
         print(exc_type, fname, exc_tb.tb_lineno)
         print(e)
         return False
+    finally:
+        signal.alarm(0)
     
 def calculate_win_score(pred_func_calls, gold_ans, tools, executable_func_dir):
     if not pred_func_calls:
@@ -313,14 +320,42 @@ def make_trace_tags(sample_id, ptc_enabled, model_name, model_provider):
 
 def get_trace_attr(trace, key, default=None):
     metadata = getattr(trace, "metadata", None) or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            metadata = {}
     attributes = metadata.get("attributes", {}) if isinstance(metadata, dict) else {}
     return attributes.get(key, default)
+
+
+def get_trace_tags(trace):
+    trace_tags = getattr(trace, "tags", None) or []
+    if trace_tags:
+        return trace_tags
+
+    metadata = getattr(trace, "metadata", None) or {}
+    if isinstance(metadata, str):
+        try:
+            metadata = json.loads(metadata)
+        except Exception:
+            metadata = {}
+
+    attributes = metadata.get("attributes", {}) if isinstance(metadata, dict) else {}
+    raw_tags = attributes.get("langfuse.trace.tags", [])
+    if isinstance(raw_tags, str):
+        try:
+            raw_tags = json.loads(raw_tags)
+        except Exception:
+            raw_tags = []
+
+    return raw_tags if isinstance(raw_tags, list) else []
 
 
 def trace_matches_expected(trace, sample_id, ptc_enabled, model_name, model_provider):
     expected_ptc = "true" if ptc_enabled else "false"
     expected_tags = set(make_trace_tags(sample_id, ptc_enabled, model_name, model_provider))
-    trace_tags = set(getattr(trace, "tags", []) or [])
+    trace_tags = set(get_trace_tags(trace))
 
     trace_sample_id = get_trace_attr(trace, "benchmark.sample_id", getattr(trace, "name", None))
     trace_ptc = str(get_trace_attr(trace, "ptc.enabled", "")).lower()
@@ -347,24 +382,27 @@ def get_trace_id_by_tags(sample_id, ptc_enabled, model_name, model_provider, ret
     for attempt in range(retries):
         try:
             traces = langfuse.api.trace.list(
-                page=1,
-                limit=10,
+                limit=1,
                 tags=tags,
             ).data
+            #print(f"[Lookup] sample_id={sample_id}, ptc_enabled={ptc_enabled}, tags={tags}, num_traces={len(traces)}")
+            #exact_matches = [
+            #    trace for trace in traces
+            #    if trace_matches_expected(trace, sample_id, ptc_enabled, model_name, model_provider)
+            #]
 
-            exact_matches = [
-                trace for trace in traces
-                if trace_matches_expected(trace, sample_id, ptc_enabled, model_name, model_provider)
-            ]
+            if len(traces) == 1:
+                print("trace id: ", traces[0].id)               
+                return traces[0].id
+            
+            if len(traces) == 0:
+                print("No trace found")
 
-            if len(exact_matches) == 1:               
-                return exact_matches[0].id
-
-            if len(exact_matches) > 1:
+            if len(traces) > 1:
                 print(
                     f"[Langfuse lookup error] Multiple exact trace matches for "
                     f"sample_id={sample_id}, ptc_enabled={ptc_enabled}, "
-                    f"model={model_provider}/{model_name}: {[trace.id for trace in exact_matches]}"
+                    f"model={model_provider}/{model_name}: {[trace.id for trace in traces]}"
                 )
                 return None
 
@@ -378,9 +416,8 @@ def get_trace_id_by_tags(sample_id, ptc_enabled, model_name, model_provider, ret
 
         except Exception as e:
             print(f"[Langfuse lookup error] {tags}: {e}")
-
-        if attempt < retries - 1:
-            time.sleep(sleep_seconds)
+            if attempt < retries - 1:
+                time.sleep(sleep_seconds)
 
     return None
 
@@ -625,8 +662,8 @@ def calculate_scores(predictions, model_name, executable_func_dir, intents_only=
                 trace_id = get_trace_id_by_tags(
                     sample_id=sample_id,
                     ptc_enabled=ptc_enabled,
-                    model_name="gpt-5-mini-2025-08-07",
-                    model_provider="OpenAI",
+                    model_name=TOOLMAN_MODEL_NAME,
+                    model_provider=TOOLMAN_MODEL_PROVIDER,
                 )
 
                 if trace_id:
